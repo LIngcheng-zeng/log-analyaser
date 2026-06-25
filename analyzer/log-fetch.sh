@@ -66,9 +66,10 @@ since_marker="\$(touch_marker "\$SINCE")"
 until_marker="\$(touch_marker "\$UNTIL")"
 trap 'rm -f "\$since_marker" "\$until_marker"' EXIT
 
-find "\$LOG_DIR" -name '*.zip' -o -name '*.log.gz' | sort | while read -r archive; do
-  # Keep archives that are newer than since_marker (approximate time window)
-  if [ "\$archive" -nt "\$since_marker" ] || [ "\$archive" -ot "\$until_marker" ] || true; then
+find "\$LOG_DIR" \( -name '*.zip' -o -name '*.log.gz' \) | sort | while read -r archive; do
+  # Keep archives whose mtime is after since_marker (loose filter: avoids missing
+  # archives from the current day whose mtime may equal or slightly precede until).
+  if [ "\$archive" -nt "\$since_marker" ]; then
     if [[ "\$archive" == *.zip ]]; then
       unzip -p "\$archive" 2>/dev/null
     else
@@ -100,16 +101,19 @@ fetch_server() {
   remote_script="$(build_remote_script "$server")"
 
   info "Fetching from $server ..."
-  ssh $SSH_OPTS "$host" "bash -s" <<< "$remote_script" 2>/dev/null \
-  | grep -F -f "$KEYWORDS_FILE" \
-  | awk -v ctx="$CONTEXT_LINES" '
-      { lines[NR] = $0; last_match[NR] = 0 }
-      END {
-        # Mark context lines around matches (simple post-pass; for real use: print with context)
-        for (i=1; i<=NR; i++) print lines[i]
-      }
-    ' \
-  || warn "Fetch failed or no matches on $server"
+  # Wrap in a subshell so SSH/grep failures are contained; a failed server does
+  # not abort the entire pipeline under set -euo pipefail.
+  {
+    ssh $SSH_OPTS "$host" "bash -s" <<< "$remote_script" 2>/dev/null \
+    | grep -F -f "$KEYWORDS_FILE" \
+    | awk -v ctx="$CONTEXT_LINES" '
+        { lines[NR] = $0; last_match[NR] = 0 }
+        END {
+          # Mark context lines around matches (simple post-pass; for real use: print with context)
+          for (i=1; i<=NR; i++) print lines[i]
+        }
+      '
+  } || { warn "Fetch failed or no matches on $server"; return 0; }
 }
 
 # ── Parallel fetch across servers ────────────────────────────────────────────

@@ -1,20 +1,26 @@
 #!/usr/bin/env bash
 # Main entry point: orchestrates full pipeline from code scan to incident report.
 #
-# Usage:
+# Minimal usage (K8s environment — servers/src/log-path auto-resolved):
 #   ./analyze.sh \
+#     --service  "order-service"                        \
+#     --entry    "createOrder"                          \
+#     --since    "1h ago"                               \
+#     --until    "now"                                  \
+#     --provider minimax
+#
+# Full usage with manual overrides:
+#   ./analyze.sh \
+#     --service  "order-service"                        \
 #     --entry    "createOrder"                          \
 #     --src      "./src"                                \
-#     --service  "order-service"                        \
-#     --servers  "app01,app02"                          \
+#     --servers  "10.0.1.1,10.0.1.2"                   \
 #     --since    "2024-01-15 10:00:00"                  \
 #     --until    "2024-01-15 11:00:00"                  \
 #     --provider minimax                                \
 #     --api-key  "$MINIMAX_API_KEY"                     \
 #     --model    "MiniMax-Text-01"                      \
 #     --output   "./reports/incident.md"
-#
-#   --log-path overrides SERVICE_LOG_PATH in config.sh when provided.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/config.sh"
@@ -23,6 +29,7 @@ source "$SCRIPT_DIR/config.sh"
 ENTRY_FUNC=""
 SRC_DIR=""
 SERVICE_NAME=""
+NAMESPACE_ARG=""
 SERVERS=""
 LOG_PATH=""
 SINCE=""
@@ -37,50 +44,124 @@ SCAN_DEPTH_ARG="$SCAN_DEPTH"
 
 usage() {
   cat <<EOF
-Usage: $0 --entry <func> --src <dir> --service <name> --servers <list>
-          --since <datetime> --until <datetime>
-          --provider <minimax|claude|ollama|openai>
-          [--log-path <path>]  # overrides SERVICE_LOG_PATH config
-          [--api-key <key>] [--model <model>] [--endpoint <url>]
-          [--user <ssh-user>] [--depth <N>] [--output <file>]
+Usage: $0 --service <name> --entry <func> --since <time> --until <time> --provider <p>
+
+Required:
+  --service   Microservice name (must be registered in config.sh SERVICE_* maps)
+  --entry     Entry function name to trace (e.g. "createOrder")
+  --since     Start of time window — absolute ("2024-01-15 10:00:00") or relative ("1h ago", "30m ago")
+  --until     End of time window   — same formats; use "now" for the current time
+  --provider  LLM provider: minimax | claude | ollama | openai
+
+Optional overrides (skip auto-resolution from service registry):
+  --src       Source directory  (overrides SERVICE_SRC_PATH)
+  --servers   Server IPs CSV   (overrides K8s node discovery)
+  --log-path  Log directory    (overrides SERVICE_LOG_PATH)
+  --namespace K8s namespace    (overrides SERVICE_NAMESPACE; default: $DEFAULT_NAMESPACE)
+
+Other options:
+  --api-key   LLM API key (or set env: MINIMAX_API_KEY / ANTHROPIC_API_KEY / OPENAI_API_KEY)
+  --model     LLM model name (default per provider in config.sh)
+  --endpoint  LLM endpoint URL override
+  --user      SSH login user for log fetch
+  --depth     Call-chain scan depth (default: $SCAN_DEPTH)
+  --output    Report output path (default: ./incident-report.md)
 EOF
   exit 1
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --entry)     ENTRY_FUNC="$2";      shift 2 ;;
-    --src)       SRC_DIR="$2";         shift 2 ;;
-    --service)   SERVICE_NAME="$2";    shift 2 ;;
-    --servers)   SERVERS="$2";         shift 2 ;;
-    --log-path)  LOG_PATH="$2";        shift 2 ;;
-    --since)     SINCE="$2";           shift 2 ;;
-    --until)     UNTIL="$2";           shift 2 ;;
-    --user)      SSH_USER_ARG="$2";    shift 2 ;;
-    --provider)  PROVIDER="$2";        shift 2 ;;
-    --api-key)   API_KEY_ARG="$2";     shift 2 ;;
-    --model)     MODEL_ARG="$2";       shift 2 ;;
-    --endpoint)  ENDPOINT_ARG="$2";    shift 2 ;;
-    --output)    OUTPUT_FILE="$2";     shift 2 ;;
-    --depth)     SCAN_DEPTH_ARG="$2";  shift 2 ;;
-    -h|--help)   usage ;;
+    --entry)      ENTRY_FUNC="$2";      shift 2 ;;
+    --src)        SRC_DIR="$2";         shift 2 ;;
+    --service)    SERVICE_NAME="$2";    shift 2 ;;
+    --namespace)  NAMESPACE_ARG="$2";   shift 2 ;;
+    --servers)    SERVERS="$2";         shift 2 ;;
+    --log-path)   LOG_PATH="$2";        shift 2 ;;
+    --since)      SINCE="$2";           shift 2 ;;
+    --until)      UNTIL="$2";           shift 2 ;;
+    --user)       SSH_USER_ARG="$2";    shift 2 ;;
+    --provider)   PROVIDER="$2";        shift 2 ;;
+    --api-key)    API_KEY_ARG="$2";     shift 2 ;;
+    --model)      MODEL_ARG="$2";       shift 2 ;;
+    --endpoint)   ENDPOINT_ARG="$2";    shift 2 ;;
+    --output)     OUTPUT_FILE="$2";     shift 2 ;;
+    --depth)      SCAN_DEPTH_ARG="$2";  shift 2 ;;
+    -h|--help)    usage ;;
     *) die "Unknown argument: $1" ;;
   esac
 done
 
-# ── Resolve log path: flag > SERVICE_LOG_PATH map ────────────────────────────
-if [[ -z "$LOG_PATH" && -n "$SERVICE_NAME" ]]; then
-  LOG_PATH="${SERVICE_LOG_PATH[$SERVICE_NAME]:-}"
-  [[ -n "$LOG_PATH" ]] && info "Resolved log path for '$SERVICE_NAME': $LOG_PATH"
-fi
+# ── Normalize time expressions to "YYYY-MM-DD HH:MM:SS" ─────────────────────
+# Accepts: absolute "2024-01-15 10:00:00", ISO8601 "2024-01-15T10:00:00",
+#          relative GNU-date strings: "30 minutes ago", "1 hour ago", "2h", etc.
+normalize_time() {
+  local input="$1"
+  # Already absolute datetime: YYYY-MM-DD HH:MM:SS or YYYY-MM-DDTHH:MM:SS
+  if [[ "$input" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}[T\ ][0-9]{2}:[0-9]{2} ]]; then
+    # Normalise T separator and truncate to seconds
+    echo "${input/T/ }" | cut -c1-19
+    return 0
+  fi
+  # Relative expressions: try "Xh ago", "Xm ago", plain GNU date strings
+  # First attempt: treat as "<value> ago" (e.g. "1h" → "1h ago")
+  local resolved
+  resolved="$(date -d "${input} ago" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" \
+    || resolved="$(date -d "${input}" '+%Y-%m-%d %H:%M:%S' 2>/dev/null)" \
+    || { echo "[ERROR] Cannot parse time expression: $input" >&2; exit 1; }
+  echo "$resolved"
+}
 
-[[ -z "$ENTRY_FUNC" ]]   && { error "--entry is required"; usage; }
-[[ -z "$SRC_DIR" ]]      && { error "--src is required";   usage; }
-[[ -z "$SERVERS" ]]      && { error "--servers is required"; usage; }
-[[ -z "$LOG_PATH" ]]     && { error "--log-path is required (or add '$SERVICE_NAME' to SERVICE_LOG_PATH in config.sh)"; usage; }
-[[ -z "$SINCE" ]]        && { error "--since is required"; usage; }
-[[ -z "$UNTIL" ]]        && { error "--until is required"; usage; }
-[[ -z "$PROVIDER" ]]     && { error "--provider is required"; usage; }
+# Normalise --since / --until before validation so error messages are accurate
+[[ -n "$SINCE" ]] && SINCE="$(normalize_time "$SINCE")"
+[[ -n "$UNTIL" ]] && UNTIL="$(normalize_time "$UNTIL")"
+
+# ── Resolve service config: src / log-path / servers from service registry ────
+# CLI flags always take precedence; this fills in only what's missing.
+resolve_service_config() {
+  [[ -z "$SERVICE_NAME" ]] && return 0
+
+  if [[ -z "$SRC_DIR" ]]; then
+    SRC_DIR="${SERVICE_SRC_PATH[$SERVICE_NAME]:-}"
+    if [[ -z "$SRC_DIR" ]]; then
+      die "No src path configured for '$SERVICE_NAME'. Add it to SERVICE_SRC_PATH in config.sh"
+    fi
+    info "Resolved src path  : $SRC_DIR"
+  fi
+
+  if [[ -z "$LOG_PATH" ]]; then
+    LOG_PATH="${SERVICE_LOG_PATH[$SERVICE_NAME]:-}"
+    if [[ -z "$LOG_PATH" ]]; then
+      die "No log path configured for '$SERVICE_NAME'. Add it to SERVICE_LOG_PATH in config.sh"
+    fi
+    info "Resolved log path  : $LOG_PATH"
+  fi
+
+  if [[ -z "$SERVERS" ]]; then
+    local namespace="${NAMESPACE_ARG:-${SERVICE_NAMESPACE[$SERVICE_NAME]:-$DEFAULT_NAMESPACE}}"
+    info "Discovering K8s nodes for '$SERVICE_NAME' in namespace '$namespace' ..."
+
+    local find_nodes="$SCRIPT_DIR/../node-ip-finder/find-nodes.sh"
+    [[ ! -f "$find_nodes" ]] && die "find-nodes.sh not found: $find_nodes"
+    [[ ! -x "$find_nodes" ]] && chmod +x "$find_nodes"
+
+    SERVERS="$("$find_nodes" --service "$SERVICE_NAME" --namespace "$namespace" --format csv)" \
+      || die "K8s node discovery failed for service '$SERVICE_NAME'"
+
+    [[ -z "$SERVERS" ]] && die "No running nodes found for '$SERVICE_NAME' in namespace '$namespace'"
+    info "Resolved servers   : $SERVERS"
+  fi
+}
+
+resolve_service_config
+
+[[ -z "$ENTRY_FUNC" ]]  && { error "--entry is required";                                                    usage; }
+[[ -z "$SRC_DIR" ]]     && { error "--src is required (or register '$SERVICE_NAME' in SERVICE_SRC_PATH)";    usage; }
+[[ -z "$SERVERS" ]]     && { error "--servers is required (or register '$SERVICE_NAME' in SERVICE_NAMESPACE)"; usage; }
+[[ -z "$LOG_PATH" ]]    && { error "--log-path is required (or register '$SERVICE_NAME' in SERVICE_LOG_PATH)"; usage; }
+[[ -z "$SINCE" ]]       && { error "--since is required"; usage; }
+[[ -z "$UNTIL" ]]       && { error "--until is required"; usage; }
+[[ -z "$PROVIDER" ]]    && { error "--provider is required"; usage; }
 
 mkdir -p "$(dirname "$OUTPUT_FILE")"
 
@@ -195,6 +276,9 @@ info "━━━ STEP 5/5: LLM Phase 2 — gap analysis & report ━━━"
   --seq      "$exec_seq" \
   --out      "$OUTPUT_FILE" \
   "${llm_common_args[@]}"
+
+# Mark pipeline as successful so EXIT trap will clean up WORK_DIR
+_PIPELINE_SUCCESS=1
 
 echo ""
 info "✓ Analysis complete. Report: $OUTPUT_FILE"

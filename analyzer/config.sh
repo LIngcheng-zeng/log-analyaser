@@ -30,20 +30,48 @@ STACK_FOLD_THRESHOLD=3   # repeat count before folding duplicate stack frames
 # ── Call-chain scan depth ────────────────────────────────────────────────────
 SCAN_DEPTH=2             # hops from entry function to trace related files
 
-# ── Service → log path mapping ───────────────────────────────────────────────
-# Add entries per microservice; --log-path flag overrides at runtime.
+# ── Service registry ─────────────────────────────────────────────────────────
+# Register each microservice here; all three maps are keyed by service name.
+# CLI flags (--src, --log-path, --servers) take precedence over these defaults.
+declare -A SERVICE_SRC_PATH=(
+  # ["order-service"]="/app/order-service/src"
+  # ["user-service"]="/app/user-service/src"
+)
+
 declare -A SERVICE_LOG_PATH=(
   # ["order-service"]="/var/log/order/"
   # ["user-service"]="/var/log/user/"
 )
 
+declare -A SERVICE_NAMESPACE=(
+  # ["order-service"]="production"
+  # ["user-service"]="production"
+)
+DEFAULT_NAMESPACE="default"
+
+# ── Bastion SSH config (used by node-ip-finder to reach K8s API) ─────────────
+# These are exported so find-nodes.sh inherits them when called as a subprocess.
+export BASTION_IP="${BASTION_IP:-}"
+export BASTION_SSH_USER="${BASTION_SSH_USER:-}"
+export BASTION_SSH_PASSWORD="${BASTION_SSH_PASSWORD:-}"
+export BASTION_EXCEL_PATH="${BASTION_EXCEL_PATH:-}"
+
 # ── SSH defaults ─────────────────────────────────────────────────────────────
 SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10"
 SSH_USER="${SSH_USER:-}"  # set via --user or SSH_USER env
 
-# ── Temp workspace (auto-cleaned on exit) ────────────────────────────────────
+# ── Temp workspace ───────────────────────────────────────────────────────────
+# Cleaned on success; preserved on failure so intermediate files can be inspected.
 WORK_DIR="$(mktemp -d /tmp/log-analyzer-XXXXXX)"
-trap 'rm -rf "$WORK_DIR"' EXIT
+_PIPELINE_SUCCESS=0
+trap '
+  if [[ "$_PIPELINE_SUCCESS" == "1" ]]; then
+    rm -rf "$WORK_DIR"
+  else
+    echo "[INFO]  Pipeline did not complete successfully." >&2
+    echo "[INFO]  Work dir preserved for inspection: $WORK_DIR" >&2
+  fi
+' EXIT
 
 # ── Logging helpers ──────────────────────────────────────────────────────────
 info()  { echo "[INFO]  $*" >&2; }
