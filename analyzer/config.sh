@@ -30,6 +30,13 @@ STACK_FOLD_THRESHOLD=3   # repeat count before folding duplicate stack frames
 # ── Call-chain scan depth ────────────────────────────────────────────────────
 SCAN_DEPTH=2             # hops from entry function to trace related files
 
+# ── Service → log path mapping ───────────────────────────────────────────────
+# Add entries per microservice; --log-path flag overrides at runtime.
+declare -A SERVICE_LOG_PATH=(
+  # ["order-service"]="/var/log/order/"
+  # ["user-service"]="/var/log/user/"
+)
+
 # ── SSH defaults ─────────────────────────────────────────────────────────────
 SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=10"
 SSH_USER="${SSH_USER:-}"  # set via --user or SSH_USER env

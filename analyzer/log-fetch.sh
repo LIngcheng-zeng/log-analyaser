@@ -10,7 +10,7 @@ source "$SCRIPT_DIR/config.sh"
 
 # ── Argument parsing ─────────────────────────────────────────────────────────
 SERVERS=""
-LOG_PATH=""
+LOG_PATH="${DEFAULT_LOG_PATH:-}"
 SINCE=""
 UNTIL=""
 KEYWORDS_FILE=""
@@ -33,7 +33,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -z "$SERVERS" ]]        && die "--servers is required"
-[[ -z "$LOG_PATH" ]]       && die "--log-path is required"
+[[ -z "$LOG_PATH" ]]       && die "--log-path is required (or set DEFAULT_LOG_PATH in config.sh)"
 [[ -z "$SINCE" ]]          && die "--since is required"
 [[ -z "$UNTIL" ]]          && die "--until is required"
 [[ -z "$KEYWORDS_FILE" ]]  && die "--keywords is required"

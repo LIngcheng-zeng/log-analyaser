@@ -5,14 +5,16 @@
 #   ./analyze.sh \
 #     --entry    "createOrder"                          \
 #     --src      "./src"                                \
+#     --service  "order-service"                        \
 #     --servers  "app01,app02"                          \
-#     --log-path "/var/log/app/"                        \
 #     --since    "2024-01-15 10:00:00"                  \
 #     --until    "2024-01-15 11:00:00"                  \
 #     --provider minimax                                \
 #     --api-key  "$MINIMAX_API_KEY"                     \
 #     --model    "MiniMax-Text-01"                      \
 #     --output   "./reports/incident.md"
+#
+#   --log-path overrides SERVICE_LOG_PATH in config.sh when provided.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/config.sh"
@@ -20,6 +22,7 @@ source "$SCRIPT_DIR/config.sh"
 # ── Argument parsing ─────────────────────────────────────────────────────────
 ENTRY_FUNC=""
 SRC_DIR=""
+SERVICE_NAME=""
 SERVERS=""
 LOG_PATH=""
 SINCE=""
@@ -34,9 +37,10 @@ SCAN_DEPTH_ARG="$SCAN_DEPTH"
 
 usage() {
   cat <<EOF
-Usage: $0 --entry <func> --src <dir> --servers <list> --log-path <path>
+Usage: $0 --entry <func> --src <dir> --service <name> --servers <list>
           --since <datetime> --until <datetime>
           --provider <minimax|claude|ollama|openai>
+          [--log-path <path>]  # overrides SERVICE_LOG_PATH config
           [--api-key <key>] [--model <model>] [--endpoint <url>]
           [--user <ssh-user>] [--depth <N>] [--output <file>]
 EOF
@@ -47,6 +51,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --entry)     ENTRY_FUNC="$2";      shift 2 ;;
     --src)       SRC_DIR="$2";         shift 2 ;;
+    --service)   SERVICE_NAME="$2";    shift 2 ;;
     --servers)   SERVERS="$2";         shift 2 ;;
     --log-path)  LOG_PATH="$2";        shift 2 ;;
     --since)     SINCE="$2";           shift 2 ;;
@@ -63,13 +68,19 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ -z "$ENTRY_FUNC" ]] && { error "--entry is required"; usage; }
-[[ -z "$SRC_DIR" ]]    && { error "--src is required";   usage; }
-[[ -z "$SERVERS" ]]    && { error "--servers is required"; usage; }
-[[ -z "$LOG_PATH" ]]   && { error "--log-path is required"; usage; }
-[[ -z "$SINCE" ]]      && { error "--since is required"; usage; }
-[[ -z "$UNTIL" ]]      && { error "--until is required"; usage; }
-[[ -z "$PROVIDER" ]]   && { error "--provider is required"; usage; }
+# ── Resolve log path: flag > SERVICE_LOG_PATH map ────────────────────────────
+if [[ -z "$LOG_PATH" && -n "$SERVICE_NAME" ]]; then
+  LOG_PATH="${SERVICE_LOG_PATH[$SERVICE_NAME]:-}"
+  [[ -n "$LOG_PATH" ]] && info "Resolved log path for '$SERVICE_NAME': $LOG_PATH"
+fi
+
+[[ -z "$ENTRY_FUNC" ]]   && { error "--entry is required"; usage; }
+[[ -z "$SRC_DIR" ]]      && { error "--src is required";   usage; }
+[[ -z "$SERVERS" ]]      && { error "--servers is required"; usage; }
+[[ -z "$LOG_PATH" ]]     && { error "--log-path is required (or add '$SERVICE_NAME' to SERVICE_LOG_PATH in config.sh)"; usage; }
+[[ -z "$SINCE" ]]        && { error "--since is required"; usage; }
+[[ -z "$UNTIL" ]]        && { error "--until is required"; usage; }
+[[ -z "$PROVIDER" ]]     && { error "--provider is required"; usage; }
 
 mkdir -p "$(dirname "$OUTPUT_FILE")"
 
